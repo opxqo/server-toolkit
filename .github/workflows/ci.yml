@@ -1,0 +1,21 @@
+name: ci
+on: [push, pull_request]
+jobs:
+  shellcheck:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - run: shellcheck -S warning harden.sh tests/*.sh
+  routing:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - run: bash tests/routing-3xui.sh
+  system:
+    runs-on: ubuntu-24.04
+    strategy:
+      matrix:
+        image: ["debian:12", "ubuntu:24.04"]
+    steps:
+      - uses: actions/checkout@v4
+      - run: bash tests/system.sh "${{ matrix.image }}"
