@@ -13,6 +13,7 @@
       {"type": "field", "outboundTag": "direct", "ip": ["geoip:cn"]},
       {"type": "field", "outboundTag": "direct", "domain": ["geosite:cn", "regexp:.*\\.cn$", "domain:keep.example"]},
       {"type": "field", "inboundTag": ["in-10001-tcp"], "outboundTag": "residential-out"},
+      {"type": "field", "user": ["paused@example"], "outboundTag": "residential-out", "enabled": false},
       {"type": "field", "outboundTag": "blocked", "protocol": ["bittorrent"]}
     ]
   }

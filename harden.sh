@@ -236,22 +236,42 @@ api() { # api METHOD PATH [curl 参数...]
   curl -fsS -k --max-time 30 -X "$method" -H "Authorization: Bearer $TOKEN" "$PANEL_URL/$path" "$@"
 }
 api_ok() { jq -e '.success == true' >/dev/null; }
+xray_running() { # 保存后 Xray 异步重启：先等它起来，见到 error 立即判失败，连续 3 次 running 才算成功
+  local ok=0 state
+  sleep 3
+  for _ in $(seq 1 15); do
+    state=$(api GET server/status 2>/dev/null | jq -r '.obj.xray.state // empty' || true)
+    [[ $state == error ]] && return 1
+    if [[ $state == running ]]; then ok=$((ok + 1)); (( ok >= 3 )) && return 0; else ok=0; fi
+    sleep 2
+  done
+  return 1
+}
 
 # ============================================================================ routing
 # 规则改写（纯 jq，便于测试）：屏蔽 private / cn / BT；从直连规则里去掉 cn；屏蔽规则排在 api 规则之后、其它规则之前。
 read -r -d '' ROUTING_JQ <<'JQ' || true
 def matcher_keys: ["domain","ip","port","sourcePort","network","source","sourceIP","user","inboundTag","protocol","attrs","localIP","localPort","vlessRoute","process"];
+def active: (.enabled == false) | not;
 def has_matcher: . as $r | any(matcher_keys[]; ($r[.] // null) | . != null and . != [] and . != "");
-def pure_block($k): .outboundTag == "blocked" and (has($k)) and ([to_entries[] | select(.key as $x | matcher_keys | index($x)) | .key] == [$k]);
+def pure_block($k): active and .outboundTag == "blocked" and (has($k)) and ([to_entries[] | select(.key as $x | matcher_keys | index($x)) | .key] == [$k]);
 def ensure_block($k; $vals):
   if any(.[]; pure_block($k)) then
     (first(to_entries[] | select(.value | pure_block($k)) | .key)) as $i
     | .[$i][$k] = ((.[$i][$k] // []) + ($vals - (.[$i][$k] // [])))
   else . + [{type: "field", outboundTag: "blocked", ($k): $vals}] end;
+def is_block: pure_block("ip") or pure_block("domain") or pure_block("protocol");
 def cn_domains: ["geosite:cn", "regexp:.*\\.cn$"];
-.routing = (.routing // {})
+# geosite:cn 收录了谷歌 / 苹果在国内可直连的域名（www.gstatic.com、reCAPTCHA、App Store 接口等），
+# 直接屏蔽会让测速和这些服务失败。屏蔽前先放行：按入站 / 用户指定出口的规则（如住宅线路）各复制一份，保持原出口；其余走默认出站。
+def exempt_prefix: "server-toolkit-exempt";   # Xray 要求 ruleTag 唯一，生成的规则按序号编号
+def is_exempt: (.ruleTag // "") | startswith(exempt_prefix);
+def exempt_domains: ["geosite:google", "geosite:apple"];
+((.outbounds // [])[0].tag // "direct") as $default
+| .routing = (.routing // {})
 | .routing.rules = (
     (.routing.rules // [])
+    | map(select(is_exempt | not))
     | map(
         if .outboundTag == "direct" then
           . as $orig
@@ -265,9 +285,14 @@ def cn_domains: ["geosite:cn", "regexp:.*\\.cn$"];
     | ensure_block("protocol"; ["bittorrent"])
     | . as $rules
     | [ $rules[] | select(.outboundTag == "api") ] as $api
-    | [ $rules[] | select(.outboundTag != "api" and (pure_block("ip") or pure_block("domain") or pure_block("protocol"))) ] as $blk
-    | [ $rules[] | select(.outboundTag != "api" and ((pure_block("ip") or pure_block("domain") or pure_block("protocol")) | not)) ] as $rest
-    | $api + $blk + $rest )
+    | [ $rules[] | select(active and has_matcher and .outboundTag != "api" and .outboundTag != "blocked" and .outboundTag != $default
+          and ((.domain // []) == []) and ((.ip // []) == []) and ((.protocol // []) == []))
+        | del(.enabled, .ruleTag) | .domain = exempt_domains ] as $keep
+    | [ {type: "field", domain: exempt_domains, outboundTag: $default} ] as $fallback
+    | [ ($keep + $fallback) | to_entries[] | .value + {ruleTag: "\(exempt_prefix)-\(.key + 1)"} ] as $exempt
+    | [ $rules[] | select(.outboundTag != "api" and is_block) ] as $blk
+    | [ $rules[] | select(.outboundTag != "api" and (is_block | not)) ] as $rest
+    | $api + $exempt + $blk + $rest )
 | .outbounds = (if any((.outbounds // [])[]; .tag == "blocked") then .outbounds
                 else (.outbounds // []) + [{tag: "blocked", protocol: "blackhole", settings: {}}] end)
 JQ
@@ -295,10 +320,15 @@ mod_routing() {
   if ! api_ok <<<"$resp"; then
     note routing 失败 "面板拒绝保存：$(jq -r '.msg // "未知原因"' <<<"$resp" 2>/dev/null)"; return
   fi
+  if ! xray_running; then
+    local why; why=$(api GET xray/getXrayResult 2>/dev/null | jq -r '.obj // empty' | tail -c 300 || true)
+    api POST xray/update --data-urlencode "xraySetting@$backup" >/dev/null 2>&1 || true
+    note routing 失败 "新配置导致 Xray 无法启动，已自动恢复原配置：${why:-未知原因}"; return
+  fi
   local saved; saved=$(api POST xray/ | jq -r '.obj' | jq -c '.xraySetting' || true)
   if [[ $(jq -S . <<<"$saved") == "$(jq -S . <<<"$next")" ]]; then
     ok "已保存并重启 Xray（原配置备份：$backup）"
-    note routing 完成 "屏蔽 cn / private / BT，屏蔽规则已置顶"
+    note routing 完成 "屏蔽 cn / private / BT（放行谷歌、苹果），屏蔽规则已置顶"
   else
     note routing 失败 "保存后读回的配置与预期不一致，请在面板里检查"
   fi
